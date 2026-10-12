@@ -5,23 +5,21 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
 const MAX_UTTERANCE_CHARS = 220;
 const MAX_RENDERED_PAGES = 8;
 const MAX_CANVAS_WIDTH = 1600;
+// A tap farther than this from any text (as a fraction of the page width) is ignored.
+const MAX_TAP_DISTANCE = 0.06;
 
 const synth = window.speechSynthesis;
+const bar = document.getElementById('bar');
 const fileInput = document.getElementById('file');
-const reader = document.getElementById('reader');
 const startButton = document.getElementById('start');
 const previousButton = document.getElementById('previous');
 const nextButton = document.getElementById('next');
 const stopButton = document.getElementById('stop');
 const speed = document.getElementById('speed');
-const speedValue = document.getElementById('speed-value');
-const meta = document.getElementById('meta');
-const currentText = document.getElementById('current-text');
 const status = document.getElementById('status');
 const voiceNote = document.getElementById('voice-note');
 const empty = document.getElementById('empty');
 const pagesElement = document.getElementById('pages');
-const readPanel = document.getElementById('read-panel');
 
 let pdfDocument = null;
 let loadGeneration = 0;
@@ -32,13 +30,17 @@ let voices = [];
 let running = false;
 let paused = false;
 let currentIndex = 0;
-let currentPage = 0;
 let speakToken = 0;
 let currentUtterance = null;
 let wakeLock = null;
 let pageObserver = null;
+let markedSheet = null;
 const renderedPages = new Map();
 const renderingPages = new Set();
+
+for (let rate = 0.7; rate < 2.05; rate += 0.1) {
+    speed.add(new Option(`${rate.toFixed(1)}x`, rate.toFixed(1), false, Math.abs(rate - 1) < 0.01));
+}
 
 
 function isDevanagari(text) {
@@ -48,21 +50,51 @@ function isDevanagari(text) {
     return devanagariCount / totalLetters > 0.4;
 }
 
+function trimRange(text, start, end) {
+    while (start < end && /\s/.test(text[start])) start++;
+    while (end > start && /\s/.test(text[end - 1])) end--;
+    return [start, end];
+}
+
 // Android speech engines cut off or reject very long utterances.
-function splitLong(text) {
-    if (text.length <= MAX_UTTERANCE_CHARS) return [text];
-    const parts = [];
-    let part = '';
-    for (const word of text.split(' ')) {
-        if (part && part.length + word.length + 1 > MAX_UTTERANCE_CHARS) {
-            parts.push(part);
-            part = word;
+function splitLong(text, start, end) {
+    const ranges = [];
+    while (end - start > MAX_UTTERANCE_CHARS) {
+        let cut = text.lastIndexOf(' ', start + MAX_UTTERANCE_CHARS);
+        if (cut <= start) cut = text.indexOf(' ', start + MAX_UTTERANCE_CHARS);
+        if (cut < 0 || cut >= end) break;
+        ranges.push([start, cut]);
+        start = cut + 1;
+    }
+    ranges.push([start, end]);
+    return ranges;
+}
+
+// Underline positions for the characters [start, end) of a page, as fractions of the page size.
+// Position inside a text run is estimated from the character count, which is close enough for an underline.
+function rangeRects(runs, start, end, pageWidth, pageHeight) {
+    const rects = [];
+    for (const run of runs) {
+        const from = Math.max(start, run.start);
+        const to = Math.min(end, run.start + run.length);
+        if (from >= to) continue;
+        const x = run.x + run.width * (from - run.start) / run.length;
+        const width = run.width * (to - from) / run.length;
+        const last = rects[rects.length - 1];
+        const sameLine = last && Math.abs(last.bottom - run.bottom) < run.height * 0.4 && x >= last.x - run.height;
+        if (sameLine) {
+            last.width = Math.max(last.x + last.width, x + width) - last.x;
+            last.top = Math.min(last.top, run.top);
         } else {
-            part = part ? `${part} ${word}` : word;
+            rects.push({ x, width, top: run.top, bottom: run.bottom, height: run.height });
         }
     }
-    if (part) parts.push(part);
-    return parts;
+    return rects.map((rect) => ({
+        x: rect.x / pageWidth,
+        y: rect.top / pageHeight,
+        w: rect.width / pageWidth,
+        h: (rect.bottom - rect.top) / pageHeight,
+    }));
 }
 
 async function extractSentences(pdf, generation) {
@@ -76,17 +108,47 @@ async function extractSentences(pdf, generation) {
         pageSizes.push({ width: viewport.width, height: viewport.height });
         const content = await page.getTextContent();
         let pageText = '';
+        const runs = [];
         for (const item of content.items) {
             if (typeof item.str !== 'string') continue;
+            if (item.str.length) {
+                const matrix = pdfjsLib.Util.transform(viewport.transform, item.transform);
+                const height = Math.hypot(matrix[2], matrix[3]) || item.height || 10;
+                runs.push({
+                    start: pageText.length,
+                    length: item.str.length,
+                    x: matrix[4],
+                    width: item.width,
+                    top: matrix[5] - height * 0.85,
+                    bottom: matrix[5] + height * 0.22,
+                    height,
+                });
+            }
             pageText += item.str;
             if (item.hasEOL) pageText += '\n';
         }
-        for (const sentence of pageText.split(/(?<=[.?!।])\s+/)) {
-            const cleaned = sentence.trim().replace(/\s+/g, ' ');
-            if (cleaned.length <= 2) continue;
-            const lang = isDevanagari(cleaned) ? 'hi' : 'en';
-            for (const text of splitLong(cleaned)) {
-                allChunks.push({ page: pageNumber, text, lang });
+
+        const sentenceRanges = [];
+        let sentenceStart = 0;
+        for (const separator of pageText.matchAll(/(?<=[.?!।])\s+/g)) {
+            sentenceRanges.push([sentenceStart, separator.index]);
+            sentenceStart = separator.index + separator[0].length;
+        }
+        sentenceRanges.push([sentenceStart, pageText.length]);
+
+        for (const [rawStart, rawEnd] of sentenceRanges) {
+            const [start, end] = trimRange(pageText, rawStart, rawEnd);
+            if (end - start <= 2) continue;
+            const lang = isDevanagari(pageText.slice(start, end)) ? 'hi' : 'en';
+            for (const [partStart, partEnd] of splitLong(pageText, start, end)) {
+                const text = pageText.slice(partStart, partEnd).trim().replace(/\s+/g, ' ');
+                if (!text) continue;
+                allChunks.push({
+                    page: pageNumber,
+                    text,
+                    lang,
+                    rects: rangeRects(runs, partStart, partEnd, viewport.width, viewport.height),
+                });
             }
         }
         page.cleanup();
@@ -98,6 +160,7 @@ function buildPages(pageSizes) {
     if (pageObserver) pageObserver.disconnect();
     renderedPages.clear();
     renderingPages.clear();
+    markedSheet = null;
     pagesElement.replaceChildren();
     pageObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
@@ -106,40 +169,23 @@ function buildPages(pageSizes) {
     }, { rootMargin: '800px 0px' });
 
     pageSizes.forEach((size, index) => {
-        const pageNumber = index + 1;
-        const figure = document.createElement('figure');
-        figure.className = 'page';
-        figure.id = `page-${pageNumber}`;
-        figure.dataset.page = pageNumber;
-        const caption = document.createElement('figcaption');
-        const label = document.createElement('span');
-        label.textContent = `Page ${pageNumber} of ${pageSizes.length}`;
-        caption.append(label);
-        const firstIndex = chunks.findIndex((chunk) => chunk.page === pageNumber);
-        if (firstIndex >= 0) {
-            const readHere = document.createElement('button');
-            readHere.type = 'button';
-            readHere.textContent = 'Read from here';
-            readHere.addEventListener('click', () => {
-                currentPage = pageNumber;
-                if (running && !paused) jumpTo(firstIndex);
-                else { showSentence(firstIndex); begin(); }
-            });
-            caption.append(readHere);
-        }
         const sheet = document.createElement('div');
-        sheet.className = 'sheet';
+        sheet.className = 'page';
+        sheet.id = `page-${index + 1}`;
+        sheet.dataset.page = index + 1;
         sheet.style.aspectRatio = `${size.width} / ${size.height}`;
-        figure.append(caption, sheet);
-        pagesElement.append(figure);
-        pageObserver.observe(figure);
+        const marks = document.createElement('div');
+        marks.className = 'marks';
+        sheet.append(marks);
+        pagesElement.append(sheet);
+        pageObserver.observe(sheet);
     });
 }
 
 async function renderPage(pageNumber) {
     if (renderedPages.has(pageNumber) || renderingPages.has(pageNumber)) return;
     const generation = loadGeneration;
-    const sheet = document.querySelector(`#page-${pageNumber} .sheet`);
+    const sheet = document.getElementById(`page-${pageNumber}`);
     if (!sheet || !pdfDocument) return;
     renderingPages.add(pageNumber);
     try {
@@ -150,10 +196,12 @@ async function renderPage(pageNumber) {
         const canvas = document.createElement('canvas');
         canvas.width = Math.floor(viewport.width);
         canvas.height = Math.floor(viewport.height);
-        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        // willReadFrequently keeps the canvas off the GPU, which sometimes drops parts of glyphs.
+        const canvasContext = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
+        await page.render({ canvasContext, viewport }).promise;
         page.cleanup();
         if (generation !== loadGeneration) return;
-        sheet.replaceChildren(canvas);
+        sheet.prepend(canvas);
         renderedPages.set(pageNumber, canvas);
         evictPages(pageNumber);
     } catch (error) {
@@ -176,9 +224,9 @@ function evictPages(keepNear) {
         canvas.remove();
         renderedPages.delete(farthest);
         // Re-observe so the page is drawn again when it scrolls back into view.
-        const figure = document.getElementById(`page-${farthest}`);
-        pageObserver.unobserve(figure);
-        pageObserver.observe(figure);
+        const sheet = document.getElementById(`page-${farthest}`);
+        pageObserver.unobserve(sheet);
+        pageObserver.observe(sheet);
     }
 }
 
@@ -208,19 +256,43 @@ function updateVoiceNote() {
         : '';
 }
 
-function showSentence(index) {
+// Draw the underline under the sentence on the PDF page and keep it on screen.
+function markSentence(chunk, follow) {
+    if (markedSheet) markedSheet.querySelector('.marks').replaceChildren();
+    const sheet = document.getElementById(`page-${chunk.page}`);
+    markedSheet = sheet;
+    if (!sheet) return;
+    const marks = sheet.querySelector('.marks');
+    for (const rect of chunk.rects) {
+        const mark = document.createElement('div');
+        mark.className = 'mark';
+        mark.style.left = `${rect.x * 100}%`;
+        mark.style.top = `${rect.y * 100}%`;
+        mark.style.width = `${rect.w * 100}%`;
+        mark.style.height = `${rect.h * 100}%`;
+        marks.append(mark);
+    }
+    if (!follow) return;
+    const first = marks.firstElementChild;
+    if (!first) {
+        sheet.scrollIntoView({ block: 'start' });
+        return;
+    }
+    const box = first.getBoundingClientRect();
+    const visibleTop = bar.offsetHeight;
+    const visibleHeight = window.innerHeight - visibleTop;
+    if (box.top < visibleTop + 8 || box.bottom > window.innerHeight - visibleHeight * 0.15) {
+        window.scrollBy({ top: box.top - (visibleTop + visibleHeight * 0.3), behavior: 'smooth' });
+    }
+}
+
+function showSentence(index, follow = true) {
     const chunk = chunks[index];
     currentIndex = index;
-    meta.textContent = `Page ${chunk.page} of ${pageCount} · Sentence ${index + 1} of ${chunks.length} · ${chunk.lang === 'hi' ? 'Hindi' : 'English (India)'}`;
-    currentText.textContent = chunk.text;
-    currentText.scrollTop = 0;
+    status.textContent = `Page ${chunk.page} of ${pageCount} · Sentence ${index + 1} of ${chunks.length} · ${chunk.lang === 'hi' ? 'Hindi' : 'English (India)'}`;
     previousButton.disabled = index === 0;
     nextButton.disabled = index >= chunks.length - 1;
-    if (chunk.page !== currentPage) {
-        const page = document.getElementById(`page-${chunk.page}`);
-        if (page) page.scrollIntoView({ block: 'start' });
-        currentPage = chunk.page;
-    }
+    markSentence(chunk, follow);
     savePosition(index);
 }
 
@@ -246,6 +318,7 @@ function speak(index) {
         halt();
         status.textContent = 'Finished reading the document.';
         savePosition(0);
+        currentIndex = 0;
         return;
     }
     showSentence(index);
@@ -267,36 +340,35 @@ function speak(index) {
     // Keep a reference: Chrome can drop the end event if the utterance is garbage collected.
     currentUtterance = utterance;
     synth.speak(utterance);
-    status.textContent = 'Reading aloud';
 }
 
 // cancel() followed immediately by speak() is dropped on Android, so restart after a short delay.
-function jumpTo(index) {
+function jumpTo(index, follow = true) {
     const token = ++speakToken;
     synth.cancel();
-    showSentence(index);
+    showSentence(index, follow);
     if (!running || paused) return;
     setTimeout(() => {
         if (token === speakToken && running && !paused) speak(index);
     }, 120);
 }
 
-function begin() {
+function begin(index = currentIndex, follow = true) {
     if (!synth || chunks.length === 0) return;
     running = true;
     paused = false;
     startButton.textContent = 'Pause';
     stopButton.disabled = false;
     requestWakeLock();
-    jumpTo(currentIndex);
+    jumpTo(index, follow);
 }
 
 function pause() {
     paused = true;
     speakToken++;
     synth.cancel();
-    startButton.textContent = 'Resume';
-    status.textContent = 'Paused.';
+    startButton.textContent = 'Play';
+    status.textContent = `Paused · Page ${chunks[currentIndex].page} of ${pageCount} · Sentence ${currentIndex + 1} of ${chunks.length}`;
     releaseWakeLock();
 }
 
@@ -306,9 +378,28 @@ function halt() {
     speakToken++;
     if (synth) synth.cancel();
     currentUtterance = null;
-    startButton.textContent = 'Start reading';
+    startButton.textContent = 'Play';
     stopButton.disabled = true;
     releaseWakeLock();
+}
+
+// The sentence whose text is nearest to a tap on a page, or -1 if the tap was on empty space.
+function sentenceAt(pageNumber, x, y, aspect) {
+    let best = -1;
+    let bestDistance = MAX_TAP_DISTANCE;
+    chunks.forEach((chunk, index) => {
+        if (chunk.page !== pageNumber) return;
+        for (const rect of chunk.rects) {
+            const dx = Math.max(rect.x - x, 0, x - (rect.x + rect.w));
+            const dy = Math.max(rect.y - y, 0, y - (rect.y + rect.h)) * aspect;
+            const distance = Math.hypot(dx, dy);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = index;
+            }
+        }
+    });
+    return best;
 }
 
 async function requestWakeLock() {
@@ -330,9 +421,9 @@ async function openPdf(file) {
     chunks = [];
     positionKey = null;
     currentIndex = 0;
-    currentPage = 0;
     startButton.disabled = true;
-    reader.hidden = true;
+    previousButton.disabled = true;
+    nextButton.disabled = true;
     empty.hidden = true;
     pagesElement.replaceChildren();
     voiceNote.textContent = '';
@@ -359,14 +450,12 @@ async function openPdf(file) {
     }
 
     if (chunks.length === 0) {
-        status.textContent = 'No selectable text was found. This may be a scanned PDF; OCR is needed to read it aloud.';
+        status.textContent = 'No selectable text found. Scanned PDFs need OCR before they can be read aloud.';
         return;
     }
-    reader.hidden = false;
     startButton.disabled = !synth;
     const resumeAt = savedPosition();
     showSentence(resumeAt);
-    status.textContent = resumeAt ? `Ready. Continuing from sentence ${resumeAt + 1}; press Stop to go back to the beginning.` : 'Ready.';
     stopButton.disabled = resumeAt === 0;
     updateVoiceNote();
 }
@@ -384,7 +473,6 @@ startButton.addEventListener('click', () => {
 stopButton.addEventListener('click', () => {
     halt();
     if (chunks.length) showSentence(0);
-    status.textContent = 'Stopped.';
 });
 
 previousButton.addEventListener('click', () => {
@@ -395,13 +483,20 @@ nextButton.addEventListener('click', () => {
     if (currentIndex + 1 < chunks.length) jumpTo(currentIndex + 1);
 });
 
-speed.addEventListener('input', () => {
-    speedValue.value = `${Number(speed.value).toFixed(1)}x`;
+// Tapping text on a page moves the underline there and reads on from that sentence.
+pagesElement.addEventListener('click', (event) => {
+    const sheet = event.target.closest('.page');
+    if (!sheet || chunks.length === 0) return;
+    const box = sheet.getBoundingClientRect();
+    const x = (event.clientX - box.left) / box.width;
+    const y = (event.clientY - box.top) / box.height;
+    const index = sentenceAt(Number(sheet.dataset.page), x, y, box.height / box.width);
+    if (index >= 0) begin(index, false);
 });
 
 // The rate of an utterance is fixed once it starts, so restart the sentence at the new speed.
 speed.addEventListener('change', () => {
-    if (running && !paused) jumpTo(currentIndex);
+    if (running && !paused) jumpTo(currentIndex, false);
 });
 
 document.addEventListener('visibilitychange', () => {
@@ -411,11 +506,6 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pagehide', () => {
     if (synth) synth.cancel();
 });
-
-new ResizeObserver(() => {
-    const sticky = getComputedStyle(readPanel).borderBottomWidth !== '0px';
-    document.documentElement.style.setProperty('--bar-h', sticky ? `${readPanel.offsetHeight}px` : '0px');
-}).observe(readPanel);
 
 if (synth) {
     synth.cancel();

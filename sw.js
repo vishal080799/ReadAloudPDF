@@ -1,5 +1,5 @@
 // Bump the version whenever any cached file changes so installed phones pick up the update.
-const CACHE = 'readaloud-v1';
+const CACHE = 'readaloud-v2';
 const FILES = [
     './',
     './index.html',
@@ -12,7 +12,7 @@ const FILES = [
 ];
 
 self.addEventListener('install', (event) => {
-    event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(FILES)).then(() => self.skipWaiting()));
+    event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(FILES.map((file) => new Request(file, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
