@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#147a63">
+<title>PDF Read-Aloud</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+    :root {
+        --bg: #ffffff; --panel: #f2f5f3; --viewer: #e9eeeb; --text: #18221f; --muted: #53635e;
+        --line: #ccd5d0; --accent: #147a63; --mark: #e5ad36; --bar-h: 0px;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root { --bg: #121715; --panel: #1c2421; --viewer: #0c100f; --text: #e6ece9; --muted: #9db0a9; --line: #33403b; --accent: #2aa387; }
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+    .read-panel { position: sticky; top: 0; z-index: 2; padding: 10px 12px; background: var(--bg); border-bottom: 1px solid var(--line); }
+    .title-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+    h1 { margin: 0; font-size: 17px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+    button, .file-button { min-height: 44px; border: 1px solid var(--line); border-radius: 5px; padding: 8px 14px; background: var(--bg); color: var(--text); font: inherit; cursor: pointer; }
+    button.primary { flex: 1 1 130px; background: var(--accent); border-color: var(--accent); color: white; }
+    button:disabled { opacity: .45; }
+    .file-button { display: inline-flex; align-items: center; min-height: 38px; padding: 6px 12px; }
+    .file-button input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+    .file-button:focus-within { outline: 2px solid var(--accent); }
+    .speed { display: grid; grid-template-columns: auto minmax(90px, 1fr) 40px; gap: 8px; align-items: center; margin-top: 8px; color: var(--muted); }
+    .speed input { width: 100%; accent-color: var(--accent); }
+    output { text-align: right; }
+    .meta, .status, .note { color: var(--muted); font-size: 13px; }
+    .meta { margin-top: 8px; }
+    .current-text { max-height: 5.4em; min-height: 2.7em; margin: 6px 0; padding: 8px 10px; overflow-y: auto; background: var(--panel); border-left: 4px solid var(--mark); font-size: 17px; line-height: 1.55; overflow-wrap: anywhere; }
+    .status { min-height: 20px; }
+    .note { margin-top: 4px; }
+    .note:empty { display: none; }
+    .pdf-viewer { padding: 10px; background: var(--viewer); min-height: 60vh; }
+    .empty { max-width: 520px; margin: 40px auto; padding: 0 8px; color: var(--muted); }
+    .page { margin: 0 auto 12px; max-width: 900px; background: white; scroll-margin-top: calc(var(--bar-h) + 8px); }
+    .page figcaption { display: flex; align-items: center; justify-content: space-between; padding: 2px 4px 2px 8px; background: var(--panel); color: var(--muted); font-size: 12px; }
+    .page figcaption button { min-height: 32px; padding: 2px 10px; font-size: 12px; }
+    .page .sheet { width: 100%; background: white; }
+    .page canvas { display: block; width: 100%; height: auto; }
+    [hidden] { display: none !important; }
+    @media (min-width: 900px) {
+        main { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(280px, 1fr); grid-template-areas: "pdf read"; gap: 14px; padding: 14px; }
+        .pdf-viewer { grid-area: pdf; border: 1px solid var(--line); }
+        .read-panel { grid-area: read; align-self: start; top: 14px; border-bottom: 0; padding: 0; }
+        .current-text { max-height: 40vh; font-size: 19px; }
+        .page { scroll-margin-top: 14px; }
+    }
+</style>
+</head>
+<body>
+<main>
+    <section class="read-panel" id="read-panel">
+        <div class="title-row">
+            <h1>PDF Read-Aloud</h1>
+            <label class="file-button">Choose PDF<input id="file" type="file" accept="application/pdf,.pdf"></label>
+        </div>
+        <div id="reader" hidden>
+            <div class="controls">
+                <button class="primary" id="start" type="button" disabled>Start reading</button>
+                <button id="previous" type="button" aria-label="Previous sentence" disabled>&#9664;</button>
+                <button id="next" type="button" aria-label="Next sentence" disabled>&#9654;</button>
+                <button id="stop" type="button" disabled>Stop</button>
+            </div>
+            <label class="speed">Speed <input id="speed" type="range" min="0.7" max="2" step="0.1" value="1"><output id="speed-value">1.0x</output></label>
+            <div class="meta" id="meta"></div>
+            <div class="current-text" id="current-text" aria-live="off"></div>
+        </div>
+        <div class="status" id="status" role="status"></div>
+        <div class="note" id="voice-note"></div>
+    </section>
+    <section class="pdf-viewer" id="pdf-viewer" aria-label="PDF pages">
+        <div class="empty" id="empty">
+            <p>Choose a PDF to begin. The PDF stays on this phone; nothing is uploaded.</p>
+            <p>Speech uses this phone's own Hindi and English (India) voices. To use the app without internet, open the browser menu and choose <strong>Add to Home screen</strong> or <strong>Install app</strong>.</p>
+            <p>Works with text-based PDFs. Scanned PDFs need OCR first.</p>
+        </div>
+        <div id="pages"></div>
+    </section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
