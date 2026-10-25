@@ -50,7 +50,8 @@
     dialog .lexicon-add input { flex: 1 1 140px; }
     dialog progress { width: 100%; }
     dialog a { color: var(--accent); }
-    .voice-row { padding: 4px 0 10px; }
+    .voice-row, .ocr-row { padding: 4px 0 10px; }
+    #damage-note button { display: block; height: 44px; margin-top: 8px; padding: 0 12px; background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
     .hint { margin: 4px 0; color: var(--muted); font-size: 13px; }
     #lexicon-list { margin: 6px 0; padding: 0; list-style: none; }
     #lexicon-list li { display: flex; gap: 6px; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--line); }
@@ -76,6 +77,7 @@
 </header>
 <main id="pdf-viewer" aria-label="PDF pages">
     <div class="note" id="voice-note"></div>
+    <div class="note" id="damage-note" role="status"></div>
     <div class="empty" id="empty">
         <p>Tap <strong>Open</strong> to choose a PDF. It stays on this phone; nothing is uploaded.</p>
         <p>Press <strong>Play</strong>, or tap any line in the PDF to start reading from there. A red underline follows the sentence being read.</p>
@@ -122,6 +124,19 @@
             </div>
         </div>
     </section>
+    <section id="ocr-section">
+        <h3>Damaged PDFs</h3>
+        <p class="hint">Some PDFs show Hindi correctly but hide broken text (missing ि and joined letters). Hindi page reading reads those pages from the page image instead.</p>
+        <div class="ocr-row">
+            <p class="ocr-status hint"></p>
+            <progress max="1" value="0" hidden></progress>
+            <div class="row">
+                <button type="button" data-action="download">Download</button>
+                <button type="button" data-action="cancel" hidden>Cancel</button>
+                <button type="button" data-action="delete" hidden>Delete</button>
+            </div>
+        </div>
+    </section>
     <section>
         <h3>Pronunciation list</h3>
         <p class="hint">For words the voice says wrongly. Type the word and how it should be said, for example <em>Jetson → jet-son</em>.</p>
@@ -149,7 +164,8 @@
             <li><strong>Pratham</strong> (Hindi), from <a href="https://huggingface.co/rhasspy/piper-voices/tree/main/hi/hi_IN/pratham/medium" rel="noopener" target="_blank">rhasspy/piper-voices</a>. Licence CC BY-NC-SA 4.0: non-commercial use only, share-alike.</li>
             <li><strong>Navgurukul</strong> (English, India), from <a href="https://huggingface.co/navgurukul-ai-labs/text-to-speech-en-IN-piper" rel="noopener" target="_blank">navgurukul-ai-labs</a>. Licence AGPL-3.0.</li>
             <li>Speech engine: <a href="https://github.com/rhasspy/piper" rel="noopener" target="_blank">Piper</a> with espeak-ng (GPL-3.0) and ONNX Runtime (MIT). Licence texts are in <code>voices/</code> and <code>vendor/</code>.</li>
-            <li>Speech is made on this phone. The PDF and its text are never uploaded.</li>
+            <li>Hindi page reading: <a href="https://github.com/naptha/tesseract.js" rel="noopener" target="_blank">Tesseract.js</a> and <a href="https://github.com/tesseract-ocr/tesseract" rel="noopener" target="_blank">Tesseract</a> with its Hindi model (Apache-2.0).</li>
+            <li>Speech and page reading happen on this phone. The PDF and its text are never uploaded.</li>
         </ul>
     </section>
 </dialog>

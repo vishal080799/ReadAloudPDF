@@ -1,5 +1,5 @@
 // Bump the version whenever any cached file changes so installed phones pick up the update.
-const CACHE = 'readaloud-v3';
+const CACHE = 'readaloud-v4';
 const FILES = [
     './',
     './index.html',
@@ -7,6 +7,7 @@ const FILES = [
     './pronounce.js',
     './voicepacks.js',
     './settings.js',
+    './ocr.js',
     './piper-worker.js',
     './manifest.webmanifest',
     './icons/icon-192.png',

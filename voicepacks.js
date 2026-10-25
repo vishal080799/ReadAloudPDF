@@ -34,7 +34,7 @@ function packFiles(lang) {
     return { [`${model}.json`]: 5000, [model]: MODEL_BYTES };
 }
 
-async function missingFiles(files) {
+export async function missingFiles(files) {
     const cache = await caches.open(VOICE_CACHE);
     const missing = [];
     for (const file of Object.keys(files)) {
@@ -61,8 +61,12 @@ export async function engineDownloaded() {
 }
 
 // onProgress(receivedBytes, totalBytes). Pass an AbortSignal to cancel.
-export async function download(lang, onProgress, signal) {
-    const files = { ...packFiles(lang), ...ENGINE_FILES };
+export function download(lang, onProgress, signal) {
+    return downloadFiles({ ...packFiles(lang), ...ENGINE_FILES }, onProgress, signal);
+}
+
+// files: { path: expectedBytes }. Stores each missing file in the offline cache.
+export async function downloadFiles(files, onProgress, signal) {
     const missing = await missingFiles(files);
     const cache = await caches.open(VOICE_CACHE);
     let total = missing.reduce((sum, file) => sum + files[file], 0);
@@ -85,6 +89,11 @@ export async function download(lang, onProgress, signal) {
         await cache.put(file, new Response(new Blob(parts), { headers }));
     }
     onProgress(total, total);
+}
+
+export async function removeFiles(files) {
+    const cache = await caches.open(VOICE_CACHE);
+    await Promise.all(Object.keys(files).map((file) => cache.delete(file)));
 }
 
 export async function remove(lang) {

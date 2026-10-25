@@ -1,5 +1,6 @@
 // The ⚙ settings dialog: a voice for each language, voice pack downloads, and the pronunciation list.
 import * as packs from './voicepacks.js';
+import * as ocr from './ocr.js';
 
 const LANGS = ['hi', 'en'];
 const LEXICON_KEY = 'readaloud:lexicon';
@@ -37,7 +38,8 @@ function mergeEntries(list, entries) {
 }
 
 // onChange(): a setting that affects speech changed. onTest(lang, text): speak text with that language's voice.
-export function initSettings({ onChange, onTest }) {
+// onOcrChange(): Hindi page reading was downloaded or deleted.
+export function initSettings({ onChange, onTest, onOcrChange }) {
     const dialog = document.getElementById('settings');
     const downloaded = { hi: false, en: false };
     const downloads = {}; // lang -> AbortController
@@ -110,9 +112,58 @@ export function initSettings({ onChange, onTest }) {
         onChange();
     }
 
+    const ocrRow = dialog.querySelector('.ocr-row');
+    let ocrDownloaded = false;
+    let ocrDownload = null; // AbortController while downloading
+
+    function renderOcr() {
+        const status = ocrRow.querySelector('.ocr-status');
+        const busy = Boolean(ocrDownload);
+        ocrRow.querySelector('[data-action="download"]').hidden = ocrDownloaded || busy || !ocr.supported();
+        ocrRow.querySelector('[data-action="cancel"]').hidden = !busy;
+        ocrRow.querySelector('[data-action="delete"]').hidden = !ocrDownloaded || busy;
+        ocrRow.querySelector('progress').hidden = !busy;
+        if (busy) return;
+        if (!ocr.supported()) status.textContent = 'Not supported in this browser.';
+        else if (ocrDownloaded) status.textContent = 'Hindi page reading is downloaded and works offline.';
+        else status.textContent = `Hindi page reading: ${ocr.OCR_MEGABYTES} MB.`;
+    }
+
+    async function startOcrDownload() {
+        const status = ocrRow.querySelector('.ocr-status');
+        const progress = ocrRow.querySelector('progress');
+        ocrDownload = new AbortController();
+        renderOcr();
+        try {
+            await ocr.download((received, total) => {
+                progress.value = total ? received / total : 0;
+                status.textContent = `Downloading: ${(received / 1e6).toFixed(1)} of ${(total / 1e6).toFixed(1)} MB`;
+            }, ocrDownload.signal);
+            ocrDownload = null;
+            ocrDownloaded = true;
+            renderOcr();
+            onOcrChange();
+        } catch (error) {
+            ocrDownload = null;
+            renderOcr();
+            if (error.name !== 'AbortError') status.textContent = `Download failed: ${error.message}. Check the internet connection and try again.`;
+        }
+    }
+
+    ocrRow.querySelector('[data-action="download"]').addEventListener('click', startOcrDownload);
+    ocrRow.querySelector('[data-action="cancel"]').addEventListener('click', () => ocrDownload?.abort());
+    ocrRow.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+        await ocr.remove();
+        ocrDownloaded = false;
+        renderOcr();
+        onOcrChange();
+    });
+
     async function refresh() {
         await Promise.all(LANGS.map(async (lang) => { downloaded[lang] = await packs.isDownloaded(lang); }));
         LANGS.forEach(renderVoice);
+        ocrDownloaded = await ocr.isDownloaded();
+        renderOcr();
     }
 
     async function startDownload(lang) {
@@ -204,6 +255,13 @@ export function initSettings({ onChange, onTest }) {
 
     return {
         usePack,
+        // Open ⚙ at the Damaged PDFs section (from the damaged-text note).
+        openOcr() {
+            refresh();
+            renderLexicon();
+            dialog.showModal();
+            document.getElementById('ocr-section').scrollIntoView({ block: 'start' });
+        },
         lexicon: (lang) => lexicon[lang === 'hi' ? 'hi' : 'en'],
         voiceLabel: (lang) => (usePack(lang) ? packs.VOICE_PACKS[lang].name : 'phone voice'),
         reportEngineError(message) {

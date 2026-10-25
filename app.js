@@ -1,6 +1,7 @@
 import * as pdfjsLib from './vendor/pdf.min.mjs';
 import { speakable } from './pronounce.js';
 import * as packs from './voicepacks.js';
+import * as ocr from './ocr.js';
 import { initSettings } from './settings.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
@@ -21,13 +22,22 @@ const stopButton = document.getElementById('stop');
 const speed = document.getElementById('speed');
 const status = document.getElementById('status');
 const voiceNote = document.getElementById('voice-note');
+const damageNote = document.getElementById('damage-note');
 const empty = document.getElementById('empty');
 const pagesElement = document.getElementById('pages');
 
 let pdfDocument = null;
 let loadGeneration = 0;
+// chunks is the flat reading order, rebuilt from pageChunks (text layer) and ocrChunks (page images).
 let chunks = [];
+let pageChunks = [];
+let pageSizes = [];
 let pageCount = 0;
+let damagedPages = new Set();
+const ocrChunks = new Map(); // page -> chunks recognised from the page image
+const recognizing = new Map(); // page -> Promise
+let ocrReady = false;
+let pendingTap = null;
 let positionKey = null;
 let voices = [];
 let running = false;
@@ -104,15 +114,47 @@ function rangeRects(runs, start, end, pageWidth, pageHeight) {
     }));
 }
 
+// Split one page's text into sentence chunks with underline boxes. runs come from the text layer or OCR.
+function chunksForPage(pageNumber, pageText, runs, size) {
+    const pageResult = [];
+    const sentenceRanges = [];
+    let sentenceStart = 0;
+    for (const separator of pageText.matchAll(/(?<=[.?!।])\s+/g)) {
+        sentenceRanges.push([sentenceStart, separator.index]);
+        sentenceStart = separator.index + separator[0].length;
+    }
+    sentenceRanges.push([sentenceStart, pageText.length]);
+
+    for (const [rawStart, rawEnd] of sentenceRanges) {
+        const [start, end] = trimRange(pageText, rawStart, rawEnd);
+        if (end - start <= 2) continue;
+        const lang = isDevanagari(pageText.slice(start, end)) ? 'hi' : 'en';
+        for (const [partStart, partEnd] of splitLong(pageText, start, end)) {
+            const text = pageText.slice(partStart, partEnd).trim().replace(/\s+/g, ' ');
+            if (!text) continue;
+            pageResult.push({
+                page: pageNumber,
+                text,
+                lang,
+                rects: rangeRects(runs, partStart, partEnd, size.width, size.height),
+            });
+        }
+    }
+    return pageResult;
+}
+
 async function extractSentences(pdf, generation) {
-    const allChunks = [];
-    const pageSizes = [];
+    const textChunks = [];
+    const sizes = [];
+    const damaged = new Set();
+    const hindiPages = [];
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
         if (generation !== loadGeneration) return null;
         status.textContent = `Reading page ${pageNumber} of ${pdf.numPages}...`;
         const page = await pdf.getPage(pageNumber);
         const viewport = page.getViewport({ scale: 1 });
-        pageSizes.push({ width: viewport.width, height: viewport.height });
+        const size = { width: viewport.width, height: viewport.height };
+        sizes.push(size);
         const content = await page.getTextContent();
         let pageText = '';
         const runs = [];
@@ -134,36 +176,114 @@ async function extractSentences(pdf, generation) {
             pageText += item.str;
             if (item.hasEOL) pageText += '\n';
         }
-
-        const sentenceRanges = [];
-        let sentenceStart = 0;
-        for (const separator of pageText.matchAll(/(?<=[.?!।])\s+/g)) {
-            sentenceRanges.push([sentenceStart, separator.index]);
-            sentenceStart = separator.index + separator[0].length;
-        }
-        sentenceRanges.push([sentenceStart, pageText.length]);
-
-        for (const [rawStart, rawEnd] of sentenceRanges) {
-            const [start, end] = trimRange(pageText, rawStart, rawEnd);
-            if (end - start <= 2) continue;
-            const lang = isDevanagari(pageText.slice(start, end)) ? 'hi' : 'en';
-            for (const [partStart, partEnd] of splitLong(pageText, start, end)) {
-                const text = pageText.slice(partStart, partEnd).trim().replace(/\s+/g, ' ');
-                if (!text) continue;
-                allChunks.push({
-                    page: pageNumber,
-                    text,
-                    lang,
-                    rects: rangeRects(runs, partStart, partEnd, viewport.width, viewport.height),
-                });
-            }
-        }
+        if (ocr.isDamagedHindi(pageText)) damaged.add(pageNumber);
+        if (/[ऀ-ॿ]/.test(pageText)) hindiPages.push(pageNumber);
+        textChunks.push(chunksForPage(pageNumber, pageText, runs, size));
         page.cleanup();
     }
-    return { allChunks, pageSizes };
+    // Short pages (a cover, a heading) are too small to judge; if most of the book is damaged,
+    // the same font is broken there too.
+    if (damaged.size >= Math.max(2, hindiPages.length / 2)) hindiPages.forEach((pageNumber) => damaged.add(pageNumber));
+    return { textChunks, sizes, damaged };
 }
 
-function buildPages(pageSizes) {
+// Damaged pages are read from the page image once OCR is downloaded; until a page is
+// recognised it is a single placeholder that recognition replaces.
+function chunksOfPage(pageNumber) {
+    if (ocrReady && damagedPages.has(pageNumber)) {
+        return ocrChunks.get(pageNumber) || [{ page: pageNumber, text: '', lang: 'hi', rects: [], pending: true }];
+    }
+    return pageChunks[pageNumber - 1] || [];
+}
+
+function firstIndexOfPage(pageNumber) {
+    return chunks.findIndex((chunk) => chunk.page >= pageNumber);
+}
+
+// Positions as { page, i } survive rebuilding, unlike flat indices.
+function positionOf(index) {
+    const chunk = chunks[index];
+    if (!chunk) return { page: 1, i: 0 };
+    return { page: chunk.page, i: index - firstIndexOfPage(chunk.page) };
+}
+
+function indexOfPosition({ page, i }) {
+    const first = firstIndexOfPage(page);
+    if (first < 0) return Math.max(0, chunks.length - 1);
+    if (chunks[first].page !== page) return first;
+    let index = first;
+    while (index - first < i && index + 1 < chunks.length && chunks[index + 1].page === page) index++;
+    return index;
+}
+
+// changedPage: clips for sentences on earlier pages keep their indices, so keep them.
+function rebuildChunks(changedPage = 1) {
+    const position = chunks.length ? positionOf(currentIndex) : null;
+    for (const [index, clip] of clips) {
+        if (chunks[index] && chunks[index].page < changedPage) continue;
+        clip.cancel();
+        clips.delete(index);
+    }
+    chunks = [];
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) chunks.push(...chunksOfPage(pageNumber));
+    if (position) currentIndex = indexOfPosition(position);
+}
+
+function recognizePage(pageNumber) {
+    if (recognizing.has(pageNumber)) return recognizing.get(pageNumber);
+    const generation = loadGeneration;
+    const job = (async () => {
+        try {
+            const page = await pdfDocument.getPage(pageNumber);
+            const { text, runs } = await ocr.recognizePage(page);
+            const result = chunksForPage(pageNumber, text, runs, pageSizes[pageNumber - 1]);
+            if (generation !== loadGeneration) return;
+            ocrChunks.set(pageNumber, result.length ? result : pageChunks[pageNumber - 1]);
+        } catch (error) {
+            if (generation !== loadGeneration) return;
+            // Fall back to the damaged text rather than stopping (003-17).
+            ocrChunks.set(pageNumber, pageChunks[pageNumber - 1]);
+            damageNote.textContent = `Could not read page ${pageNumber} from the image (${error.message}). Reading its damaged text instead.`;
+        }
+        rebuildChunks(pageNumber);
+        if (!running || paused) {
+            showSentence(currentIndex, false);
+            if (!running) stopButton.disabled = currentIndex === 0;
+        }
+    })();
+    recognizing.set(pageNumber, job);
+    return job;
+}
+
+// Recognise the next damaged page in the background while this one is read (003-12).
+function recognizeAhead(pageNumber) {
+    for (let next = pageNumber + 1; next <= Math.min(pageCount, pageNumber + 2); next++) {
+        const first = chunks[firstIndexOfPage(next)];
+        if (first && first.page === next && first.pending) {
+            recognizePage(next);
+            return;
+        }
+    }
+}
+
+function updateDamageNote() {
+    damageNote.replaceChildren();
+    if (!damagedPages.size) return;
+    const pages = damagedPages.size === 1 ? '1 page' : `${damagedPages.size} pages`;
+    if (ocrReady) {
+        damageNote.textContent = `This PDF's Hindi text is damaged on ${pages}. Those pages are read from the page image instead.`;
+        return;
+    }
+    damageNote.append(`This PDF's Hindi text is damaged on ${pages}, so words would be read wrongly. `);
+    if (!ocr.supported()) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `Download Hindi page reading (${ocr.OCR_MEGABYTES} MB)`;
+    button.addEventListener('click', () => settings.openOcr());
+    damageNote.append(button);
+}
+
+function buildPages() {
     if (pageObserver) pageObserver.disconnect();
     renderedPages.clear();
     renderingPages.clear();
@@ -296,7 +416,9 @@ function markSentence(chunk, follow) {
 function showSentence(index, follow = true) {
     const chunk = chunks[index];
     currentIndex = index;
-    status.textContent = `Page ${chunk.page} of ${pageCount} · Sentence ${index + 1} of ${chunks.length} · ${chunk.lang === 'hi' ? 'Hindi' : 'English'} · ${settings.voiceLabel(chunk.lang)}`;
+    status.textContent = chunk.pending
+        ? `Page ${chunk.page} of ${pageCount} · Reading page image ${chunk.page}…`
+        : `Page ${chunk.page} of ${pageCount} · Sentence ${index + 1} of ${chunks.length} · ${chunk.lang === 'hi' ? 'Hindi' : 'English'} · ${settings.voiceLabel(chunk.lang)}`;
     previousButton.disabled = index === 0;
     nextButton.disabled = index >= chunks.length - 1;
     markSentence(chunk, follow);
@@ -306,15 +428,17 @@ function showSentence(index, follow = true) {
 function savePosition(index) {
     if (!positionKey) return;
     try {
-        if (index > 0) localStorage.setItem(positionKey, String(index));
+        if (index > 0) localStorage.setItem(positionKey, JSON.stringify(positionOf(index)));
         else localStorage.removeItem(positionKey);
     } catch (error) { /* storage may be unavailable */ }
 }
 
 function savedPosition() {
     try {
-        const index = Number(localStorage.getItem(positionKey));
-        return Number.isInteger(index) && index > 0 && index < chunks.length ? index : 0;
+        const saved = JSON.parse(localStorage.getItem(positionKey));
+        // Older versions saved a plain sentence index.
+        if (Number.isInteger(saved)) return saved > 0 && saved < chunks.length ? saved : 0;
+        return saved && Number.isInteger(saved.page) ? indexOfPosition(saved) : 0;
     } catch (error) {
         return 0;
     }
@@ -330,7 +454,23 @@ function speak(index) {
     }
     showSentence(index);
     const token = ++speakToken;
-    if (settings.usePack(chunks[index].lang)) speakWithPack(index, token);
+    const chunk = chunks[index];
+    if (chunk.pending) {
+        // Recognise the page image first, then read from its first (or tapped) sentence.
+        recognizePage(chunk.page).then(() => {
+            if (token !== speakToken || !running || paused) return;
+            let target = firstIndexOfPage(chunk.page);
+            if (pendingTap && pendingTap.page === chunk.page) {
+                const tapped = sentenceAt(pendingTap.page, pendingTap.x, pendingTap.y, pendingTap.aspect);
+                if (tapped >= 0) target = tapped;
+            }
+            pendingTap = null;
+            speak(target);
+        });
+        return;
+    }
+    recognizeAhead(chunk.page);
+    if (settings.usePack(chunk.lang)) speakWithPack(index, token);
     else speakWithPhone(index, token);
 }
 
@@ -375,7 +515,7 @@ function getClip(index) {
 
 // Make the next sentence while this one plays, so there is no gap between them.
 function prefetch(index) {
-    if (index < chunks.length && settings.usePack(chunks[index].lang)) getClip(index).catch(() => {});
+    if (index < chunks.length && !chunks[index].pending && settings.usePack(chunks[index].lang)) getClip(index).catch(() => {});
 }
 
 // Drop clips that are no longer near the sentence being read; cancelled ones are skipped by the worker.
@@ -455,7 +595,10 @@ function pause() {
     if (synth) synth.cancel();
     stopPackAudio();
     startButton.textContent = 'Play';
-    status.textContent = `Paused · Page ${chunks[currentIndex].page} of ${pageCount} · Sentence ${currentIndex + 1} of ${chunks.length} · ${settings.voiceLabel(chunks[currentIndex].lang)}`;
+    const chunk = chunks[currentIndex];
+    status.textContent = chunk.pending
+        ? `Paused · Page ${chunk.page} of ${pageCount}`
+        : `Paused · Page ${chunk.page} of ${pageCount} · Sentence ${currentIndex + 1} of ${chunks.length} · ${settings.voiceLabel(chunk.lang)}`;
     releaseWakeLock();
 }
 
@@ -478,6 +621,12 @@ function sentenceAt(pageNumber, x, y, aspect) {
     let bestDistance = MAX_TAP_DISTANCE;
     chunks.forEach((chunk, index) => {
         if (chunk.page !== pageNumber) return;
+        // A page not yet read from its image has no boxes; any tap on it starts there.
+        if (chunk.pending) {
+            best = index;
+            bestDistance = -1;
+            return;
+        }
         for (const rect of chunk.rects) {
             const dx = Math.max(rect.x - x, 0, x - (rect.x + rect.w));
             const dy = Math.max(rect.y - y, 0, y - (rect.y + rect.h)) * aspect;
@@ -508,6 +657,12 @@ async function openPdf(file) {
     const generation = ++loadGeneration;
     halt();
     chunks = [];
+    pageChunks = [];
+    damagedPages = new Set();
+    ocrChunks.clear();
+    recognizing.clear();
+    pendingTap = null;
+    damageNote.replaceChildren();
     positionKey = null;
     currentIndex = 0;
     startButton.disabled = true;
@@ -527,10 +682,15 @@ async function openPdf(file) {
         pdfDocument = pdf;
         const result = await extractSentences(pdf, generation);
         if (!result || generation !== loadGeneration) return;
-        chunks = result.allChunks;
+        pageChunks = result.textChunks;
+        pageSizes = result.sizes;
+        damagedPages = result.damaged;
         pageCount = pdf.numPages;
+        ocrReady = damagedPages.size > 0 && await ocr.isDownloaded();
+        if (generation !== loadGeneration) return;
+        rebuildChunks();
         positionKey = `readaloud:position:${file.name}:${file.size}`;
-        buildPages(result.pageSizes);
+        buildPages();
     } catch (error) {
         if (generation !== loadGeneration) return;
         empty.hidden = false;
@@ -547,7 +707,10 @@ async function openPdf(file) {
     showSentence(resumeAt);
     stopButton.disabled = resumeAt === 0;
     updateVoiceNote();
+    updateDamageNote();
     preloadPacks();
+    // Start on the page the reader will hear first, so Play doesn't wait for it.
+    if (chunks[resumeAt].pending) recognizePage(chunks[resumeAt].page);
 }
 
 fileInput.addEventListener('change', () => {
@@ -580,8 +743,11 @@ pagesElement.addEventListener('click', (event) => {
     const box = sheet.getBoundingClientRect();
     const x = (event.clientX - box.left) / box.width;
     const y = (event.clientY - box.top) / box.height;
-    const index = sentenceAt(Number(sheet.dataset.page), x, y, box.height / box.width);
-    if (index >= 0) begin(index, false);
+    const pageNumber = Number(sheet.dataset.page);
+    const index = sentenceAt(pageNumber, x, y, box.height / box.width);
+    if (index < 0) return;
+    pendingTap = chunks[index].pending ? { page: pageNumber, x, y, aspect: box.height / box.width } : null;
+    begin(index, false);
 });
 
 // The rate of an utterance or clip is fixed once it is made, so restart the sentence at the new speed.
@@ -629,6 +795,18 @@ const settings = initSettings({
         else showSentence(currentIndex, false);
     },
     onTest: testVoice,
+    // OCR was downloaded or deleted: switch damaged pages between page images and text.
+    onOcrChange: async () => {
+        ocrReady = damagedPages.size > 0 && await ocr.isDownloaded();
+        updateDamageNote();
+        if (!chunks.length) return;
+        rebuildChunks();
+        if (running && !paused) jumpTo(currentIndex, false);
+        else {
+            showSentence(currentIndex, false);
+            if (chunks[currentIndex].pending) recognizePage(chunks[currentIndex].page);
+        }
+    },
 });
 
 document.addEventListener('visibilitychange', () => {
