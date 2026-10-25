@@ -21,8 +21,8 @@
     body { margin: 0; background: var(--viewer); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
     /* The bar takes a tenth of the screen; the PDF gets the rest. */
     .bar { position: sticky; top: 0; z-index: 5; display: flex; flex-direction: column; justify-content: center; gap: 2px; height: 10vh; height: 10dvh; min-height: 58px; max-height: 110px; padding: 4px 8px; background: var(--bg); border-bottom: 1px solid var(--line); }
-    .controls { display: flex; flex: 1 1 auto; gap: 6px; align-items: center; min-height: 0; }
-    button, select, .file-button { flex: 0 0 auto; height: 100%; min-height: 34px; max-height: 46px; min-width: 42px; border: 1px solid var(--line); border-radius: 5px; padding: 0 10px; background: var(--bg); color: var(--text); font: inherit; cursor: pointer; }
+    .controls { display: flex; flex: 1 1 auto; gap: 5px; align-items: center; min-height: 0; }
+    button, select, .file-button { flex: 0 0 auto; height: 100%; min-height: 34px; max-height: 46px; min-width: 40px; border: 1px solid var(--line); border-radius: 5px; padding: 0 9px; background: var(--bg); color: var(--text); font: inherit; cursor: pointer; }
     button.primary { flex: 1 1 auto; background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
     button:disabled, select:disabled { opacity: .45; }
     select { padding: 0 4px; }
@@ -37,6 +37,27 @@
     .page canvas { display: block; width: 100%; height: 100%; }
     .marks { position: absolute; inset: 0; pointer-events: none; }
     .mark { position: absolute; box-sizing: content-box; border-bottom: 3px solid var(--mark); }
+    dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0 16px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
+    dialog::backdrop { background: rgb(0 0 0 / .45); }
+    .dialog-head { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; padding: 12px 0 8px; background: var(--bg); }
+    dialog h2 { margin: 0; font-size: 18px; }
+    dialog h3 { margin: 18px 0 6px; font-size: 15px; }
+    dialog section { border-top: 1px solid var(--line); }
+    dialog label { display: grid; gap: 4px; margin: 8px 0; }
+    dialog select, dialog input[type="text"] { width: 100%; height: 44px; min-width: 0; padding: 0 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--text); font: inherit; }
+    dialog button, dialog .file-button { height: 40px; margin: 0; }
+    dialog .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+    dialog .lexicon-add input { flex: 1 1 140px; }
+    dialog progress { width: 100%; }
+    dialog a { color: var(--accent); }
+    .voice-row { padding: 4px 0 10px; }
+    .hint { margin: 4px 0; color: var(--muted); font-size: 13px; }
+    #lexicon-list { margin: 6px 0; padding: 0; list-style: none; }
+    #lexicon-list li { display: flex; gap: 6px; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--line); }
+    #lexicon-list li span { flex: 1 1 auto; overflow-wrap: anywhere; }
+    #lexicon-list li button { height: 36px; }
+    .about { padding-left: 18px; font-size: 13px; }
+    .about li { margin: 6px 0; }
     [hidden] { display: none !important; }
 </style>
 </head>
@@ -49,6 +70,7 @@
         <button id="next" type="button" aria-label="Next sentence" disabled>&raquo;</button>
         <button id="stop" type="button" aria-label="Stop and go back to the beginning" disabled>&#9632;</button>
         <select id="speed" aria-label="Reading speed"></select>
+        <button id="settings-button" type="button" aria-label="Voices and pronunciation settings">&#9881;</button>
     </div>
     <div class="status" id="status" role="status"></div>
 </header>
@@ -57,11 +79,80 @@
     <div class="empty" id="empty">
         <p>Tap <strong>Open</strong> to choose a PDF. It stays on this phone; nothing is uploaded.</p>
         <p>Press <strong>Play</strong>, or tap any line in the PDF to start reading from there. A red underline follows the sentence being read.</p>
-        <p>Speech uses this phone's own Hindi and English (India) voices. To use the app without internet, open the browser menu and choose <strong>Add to Home screen</strong> or <strong>Install app</strong>.</p>
+        <p>For natural Indian voices, tap <strong>&#9881;</strong> and download the Hindi (Pratham) and English (Navgurukul) voice packs. Until then the phone's own voices are used. To use the app without internet, open the browser menu and choose <strong>Add to Home screen</strong> or <strong>Install app</strong>.</p>
         <p>Works with text-based PDFs. Scanned PDFs need OCR first.</p>
     </div>
     <div id="pages"></div>
 </main>
+<dialog id="settings" aria-labelledby="settings-title">
+    <div class="dialog-head">
+        <h2 id="settings-title">Settings</h2>
+        <button id="settings-close" type="button" aria-label="Close settings">&#10005;</button>
+    </div>
+    <section>
+        <h3>Voices</h3>
+        <div class="voice-row" data-lang="hi">
+            <label>Hindi voice
+                <select>
+                    <option value="pack">Pratham · Indian voice pack</option>
+                    <option value="phone">Phone voice</option>
+                </select>
+            </label>
+            <p class="pack-status hint"></p>
+            <progress max="1" value="0" hidden></progress>
+            <div class="row">
+                <button type="button" data-action="download">Download</button>
+                <button type="button" data-action="cancel" hidden>Cancel</button>
+                <button type="button" data-action="delete" hidden>Delete</button>
+            </div>
+        </div>
+        <div class="voice-row" data-lang="en">
+            <label>English voice
+                <select>
+                    <option value="pack">Navgurukul · Indian voice pack</option>
+                    <option value="phone">Phone voice</option>
+                </select>
+            </label>
+            <p class="pack-status hint"></p>
+            <progress max="1" value="0" hidden></progress>
+            <div class="row">
+                <button type="button" data-action="download">Download</button>
+                <button type="button" data-action="cancel" hidden>Cancel</button>
+                <button type="button" data-action="delete" hidden>Delete</button>
+            </div>
+        </div>
+    </section>
+    <section>
+        <h3>Pronunciation list</h3>
+        <p class="hint">For words the voice says wrongly. Type the word and how it should be said, for example <em>Jetson → jet-son</em>.</p>
+        <label>Language
+            <select id="lexicon-lang">
+                <option value="en">English</option>
+                <option value="hi">Hindi</option>
+            </select>
+        </label>
+        <ul id="lexicon-list"></ul>
+        <div class="row lexicon-add">
+            <input id="lexicon-word" type="text" placeholder="Word" aria-label="Word" autocomplete="off">
+            <input id="lexicon-say" type="text" placeholder="Say as" aria-label="Say as" autocomplete="off">
+        </div>
+        <div class="row">
+            <button id="lexicon-test" type="button">Test</button>
+            <button id="lexicon-add" type="button">Add</button>
+            <button id="lexicon-export" type="button">Export</button>
+            <label class="file-button">Import<input id="lexicon-import" type="file" accept="application/json,.json"></label>
+        </div>
+    </section>
+    <section>
+        <h3>About voices</h3>
+        <ul class="about">
+            <li><strong>Pratham</strong> (Hindi), from <a href="https://huggingface.co/rhasspy/piper-voices/tree/main/hi/hi_IN/pratham/medium" rel="noopener" target="_blank">rhasspy/piper-voices</a>. Licence CC BY-NC-SA 4.0: non-commercial use only, share-alike.</li>
+            <li><strong>Navgurukul</strong> (English, India), from <a href="https://huggingface.co/navgurukul-ai-labs/text-to-speech-en-IN-piper" rel="noopener" target="_blank">navgurukul-ai-labs</a>. Licence AGPL-3.0.</li>
+            <li>Speech engine: <a href="https://github.com/rhasspy/piper" rel="noopener" target="_blank">Piper</a> with espeak-ng (GPL-3.0) and ONNX Runtime (MIT). Licence texts are in <code>voices/</code> and <code>vendor/</code>.</li>
+            <li>Speech is made on this phone. The PDF and its text are never uploaded.</li>
+        </ul>
+    </section>
+</dialog>
 <script type="module" src="app.js"></script>
 </body>
 </html>

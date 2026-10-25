@@ -1,4 +1,7 @@
 import * as pdfjsLib from './vendor/pdf.min.mjs';
+import { speakable } from './pronounce.js';
+import * as packs from './voicepacks.js';
+import { initSettings } from './settings.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
 
@@ -37,6 +40,10 @@ let pageObserver = null;
 let markedSheet = null;
 const renderedPages = new Map();
 const renderingPages = new Set();
+// Voice pack audio: one player, and clips made ahead of time by sentence index.
+const packPlayer = new Audio();
+const clips = new Map(); // index -> { promise, cancel }
+let packObjectUrl = null;
 
 for (let rate = 0.7; rate < 2.05; rate += 0.1) {
     speed.add(new Option(`${rate.toFixed(1)}x`, rate.toFixed(1), false, Math.abs(rate - 1) < 0.01));
@@ -250,9 +257,9 @@ function updateVoiceNote() {
         return;
     }
     // Android often reports an empty list even though speech works, so only warn on a known gap.
-    const missingHindi = voices.length > 0 && chunks.some((chunk) => chunk.lang === 'hi') && !pickVoice('hi');
+    const missingHindi = voices.length > 0 && chunks.some((chunk) => chunk.lang === 'hi') && !settings.usePack('hi') && !pickVoice('hi');
     voiceNote.textContent = missingHindi
-        ? 'No Hindi voice found on this device. Install it in Settings → Text-to-speech output → Install voice data → Hindi.'
+        ? 'No Hindi voice found on this device. Tap ⚙ to download the Pratham Hindi voice pack, or install one in Settings → Text-to-speech output → Install voice data → Hindi.'
         : '';
 }
 
@@ -289,7 +296,7 @@ function markSentence(chunk, follow) {
 function showSentence(index, follow = true) {
     const chunk = chunks[index];
     currentIndex = index;
-    status.textContent = `Page ${chunk.page} of ${pageCount} · Sentence ${index + 1} of ${chunks.length} · ${chunk.lang === 'hi' ? 'Hindi' : 'English (India)'}`;
+    status.textContent = `Page ${chunk.page} of ${pageCount} · Sentence ${index + 1} of ${chunks.length} · ${chunk.lang === 'hi' ? 'Hindi' : 'English'} · ${settings.voiceLabel(chunk.lang)}`;
     previousButton.disabled = index === 0;
     nextButton.disabled = index >= chunks.length - 1;
     markSentence(chunk, follow);
@@ -323,8 +330,22 @@ function speak(index) {
     }
     showSentence(index);
     const token = ++speakToken;
+    if (settings.usePack(chunks[index].lang)) speakWithPack(index, token);
+    else speakWithPhone(index, token);
+}
+
+function spokenText(chunk) {
+    return speakable(chunk.text, chunk.lang, settings.lexicon(chunk.lang));
+}
+
+function speakWithPhone(index, token) {
+    if (!synth) {
+        halt();
+        status.textContent = 'This browser has no text-to-speech. Tap ⚙ to download the Indian voice packs.';
+        return;
+    }
     const chunk = chunks[index];
-    const utterance = new SpeechSynthesisUtterance(chunk.text);
+    const utterance = new SpeechSynthesisUtterance(spokenText(chunk));
     const voice = pickVoice(chunk.lang);
     if (voice) utterance.voice = voice;
     utterance.lang = voice ? voice.lang.replace('_', '-') : (chunk.lang === 'hi' ? 'hi-IN' : 'en-IN');
@@ -342,10 +363,75 @@ function speak(index) {
     synth.speak(utterance);
 }
 
+function getClip(index) {
+    if (!clips.has(index)) {
+        const chunk = chunks[index];
+        const clip = packs.synthesize(chunk.lang, spokenText(chunk), Number(speed.value));
+        clip.promise.catch(() => clips.delete(index));
+        clips.set(index, clip);
+    }
+    return clips.get(index).promise;
+}
+
+// Make the next sentence while this one plays, so there is no gap between them.
+function prefetch(index) {
+    if (index < chunks.length && settings.usePack(chunks[index].lang)) getClip(index).catch(() => {});
+}
+
+// Drop clips that are no longer near the sentence being read; cancelled ones are skipped by the worker.
+function dropClips(keep = new Set()) {
+    for (const [index, clip] of clips) {
+        if (keep.has(index)) continue;
+        clip.cancel();
+        clips.delete(index);
+    }
+}
+
+function stopPackAudio() {
+    packPlayer.onended = null;
+    packPlayer.pause();
+}
+
+async function speakWithPack(index, token) {
+    const chunk = chunks[index];
+    const ready = setTimeout(() => {
+        if (token === speakToken) status.textContent += ' · preparing voice…';
+    }, 400);
+    try {
+        const wav = await getClip(index);
+        clearTimeout(ready);
+        if (token !== speakToken || !running || paused) return;
+        showSentence(index, false);
+        if (packObjectUrl) URL.revokeObjectURL(packObjectUrl);
+        packObjectUrl = URL.createObjectURL(wav);
+        packPlayer.src = packObjectUrl;
+        packPlayer.onended = () => {
+            clips.delete(index);
+            if (token === speakToken && running && !paused) speak(index + 1);
+        };
+        await packPlayer.play();
+        prefetch(index + 1);
+    } catch (error) {
+        clearTimeout(ready);
+        if (token !== speakToken || error.name === 'AbortError') return;
+        if (error.name === 'NotAllowedError') {
+            pause();
+            status.textContent = 'Tap Play to start the audio.';
+            return;
+        }
+        // Read this sentence with the phone voice rather than stopping.
+        voiceNote.textContent = `The ${packs.VOICE_PACKS[chunk.lang].name} voice pack failed (${error.message}). Using the phone voice for now.`;
+        if (/engine|memory|WebAssembly/i.test(error.message)) settings.reportEngineError(error.message);
+        speakWithPhone(index, token);
+    }
+}
+
 // cancel() followed immediately by speak() is dropped on Android, so restart after a short delay.
 function jumpTo(index, follow = true) {
     const token = ++speakToken;
-    synth.cancel();
+    if (synth) synth.cancel();
+    stopPackAudio();
+    dropClips(new Set([index, index + 1]));
     showSentence(index, follow);
     if (!running || paused) return;
     setTimeout(() => {
@@ -354,7 +440,7 @@ function jumpTo(index, follow = true) {
 }
 
 function begin(index = currentIndex, follow = true) {
-    if (!synth || chunks.length === 0) return;
+    if (chunks.length === 0) return;
     running = true;
     paused = false;
     startButton.textContent = 'Pause';
@@ -366,9 +452,10 @@ function begin(index = currentIndex, follow = true) {
 function pause() {
     paused = true;
     speakToken++;
-    synth.cancel();
+    if (synth) synth.cancel();
+    stopPackAudio();
     startButton.textContent = 'Play';
-    status.textContent = `Paused · Page ${chunks[currentIndex].page} of ${pageCount} · Sentence ${currentIndex + 1} of ${chunks.length}`;
+    status.textContent = `Paused · Page ${chunks[currentIndex].page} of ${pageCount} · Sentence ${currentIndex + 1} of ${chunks.length} · ${settings.voiceLabel(chunks[currentIndex].lang)}`;
     releaseWakeLock();
 }
 
@@ -377,6 +464,8 @@ function halt() {
     paused = false;
     speakToken++;
     if (synth) synth.cancel();
+    stopPackAudio();
+    dropClips();
     currentUtterance = null;
     startButton.textContent = 'Play';
     stopButton.disabled = true;
@@ -453,11 +542,12 @@ async function openPdf(file) {
         status.textContent = 'No selectable text found. Scanned PDFs need OCR before they can be read aloud.';
         return;
     }
-    startButton.disabled = !synth;
+    startButton.disabled = !synth && !packs.supported();
     const resumeAt = savedPosition();
     showSentence(resumeAt);
     stopButton.disabled = resumeAt === 0;
     updateVoiceNote();
+    preloadPacks();
 }
 
 fileInput.addEventListener('change', () => {
@@ -494,9 +584,51 @@ pagesElement.addEventListener('click', (event) => {
     if (index >= 0) begin(index, false);
 });
 
-// The rate of an utterance is fixed once it starts, so restart the sentence at the new speed.
+// The rate of an utterance or clip is fixed once it is made, so restart the sentence at the new speed.
 speed.addEventListener('change', () => {
+    dropClips();
     if (running && !paused) jumpTo(currentIndex, false);
+});
+
+// Load the voice packs this PDF needs into memory now, so the first sentence starts quickly.
+function preloadPacks() {
+    for (const lang of new Set(chunks.map((chunk) => chunk.lang))) {
+        if (settings.usePack(lang)) packs.preload(lang).catch((error) => settings.reportEngineError(error.message));
+    }
+}
+
+function testVoice(lang, text) {
+    if (running && !paused) pause();
+    if (synth) synth.cancel();
+    stopPackAudio();
+    if (settings.usePack(lang)) {
+        packs.synthesize(lang, text, Number(speed.value)).promise.then((wav) => {
+            if (packObjectUrl) URL.revokeObjectURL(packObjectUrl);
+            packObjectUrl = URL.createObjectURL(wav);
+            packPlayer.src = packObjectUrl;
+            return packPlayer.play();
+        }).catch((error) => alert(`Could not test the voice: ${error.message}`));
+    } else if (synth) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        const voice = pickVoice(lang);
+        if (voice) utterance.voice = voice;
+        utterance.lang = voice ? voice.lang.replace('_', '-') : (lang === 'hi' ? 'hi-IN' : 'en-IN');
+        utterance.rate = Number(speed.value);
+        currentUtterance = utterance;
+        synth.speak(utterance);
+    }
+}
+
+const settings = initSettings({
+    onChange: () => {
+        dropClips();
+        updateVoiceNote();
+        if (!chunks.length) return;
+        preloadPacks();
+        if (running && !paused) jumpTo(currentIndex, false);
+        else showSentence(currentIndex, false);
+    },
+    onTest: testVoice,
 });
 
 document.addEventListener('visibilitychange', () => {
@@ -505,6 +637,7 @@ document.addEventListener('visibilitychange', () => {
 
 window.addEventListener('pagehide', () => {
     if (synth) synth.cancel();
+    stopPackAudio();
 });
 
 if (synth) {
