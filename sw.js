@@ -1,5 +1,5 @@
 // Bump the version whenever any cached file changes so installed phones pick up the update.
-const CACHE = 'readaloud-v4';
+const CACHE = 'readaloud-v5';
 const FILES = [
     './',
     './index.html',

@@ -125,8 +125,8 @@ export function initSettings({ onChange, onTest, onOcrChange }) {
         ocrRow.querySelector('progress').hidden = !busy;
         if (busy) return;
         if (!ocr.supported()) status.textContent = 'Not supported in this browser.';
-        else if (ocrDownloaded) status.textContent = 'Hindi page reading is downloaded and works offline.';
-        else status.textContent = `Hindi page reading: ${ocr.OCR_MEGABYTES} MB.`;
+        else if (ocrDownloaded) status.textContent = 'Page reading (Hindi and English) is downloaded and works offline.';
+        else status.textContent = `Page reading (Hindi and English): ${ocr.OCR_MEGABYTES} MB.`;
     }
 
     async function startOcrDownload() {

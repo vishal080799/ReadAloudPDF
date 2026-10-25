@@ -34,6 +34,9 @@ let pageChunks = [];
 let pageSizes = [];
 let pageCount = 0;
 let damagedPages = new Set();
+let scannedPages = new Set();
+// Scanned pages start with both languages, then narrow to what the document turns out to be (004-04).
+let scanLangs = 'eng+hin';
 const ocrChunks = new Map(); // page -> chunks recognised from the page image
 const recognizing = new Map(); // page -> Promise
 let ocrReady = false;
@@ -147,6 +150,7 @@ async function extractSentences(pdf, generation) {
     const textChunks = [];
     const sizes = [];
     const damaged = new Set();
+    const scanned = new Set();
     const hindiPages = [];
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
         if (generation !== loadGeneration) return null;
@@ -176,22 +180,30 @@ async function extractSentences(pdf, generation) {
             pageText += item.str;
             if (item.hasEOL) pageText += '\n';
         }
-        if (ocr.isDamagedHindi(pageText)) damaged.add(pageNumber);
+        if (ocr.isScannedPage(pageText)) scanned.add(pageNumber);
+        else if (ocr.isDamagedHindi(pageText)) damaged.add(pageNumber);
         if (/[ऀ-ॿ]/.test(pageText)) hindiPages.push(pageNumber);
         textChunks.push(chunksForPage(pageNumber, pageText, runs, size));
         page.cleanup();
     }
     // Short pages (a cover, a heading) are too small to judge; if most of the book is damaged,
     // the same font is broken there too.
-    if (damaged.size >= Math.max(2, hindiPages.length / 2)) hindiPages.forEach((pageNumber) => damaged.add(pageNumber));
-    return { textChunks, sizes, damaged };
+    if (damaged.size >= Math.max(2, hindiPages.length / 2)) {
+        hindiPages.forEach((pageNumber) => { if (!scanned.has(pageNumber)) damaged.add(pageNumber); });
+    }
+    return { textChunks, sizes, damaged, scanned };
 }
 
-// Damaged pages are read from the page image once OCR is downloaded; until a page is
-// recognised it is a single placeholder that recognition replaces.
+function needsOcr(pageNumber) {
+    return damagedPages.has(pageNumber) || scannedPages.has(pageNumber);
+}
+
+// Damaged and scanned pages are read from the page image once OCR is downloaded; until a page
+// is recognised it is a single placeholder that recognition replaces.
 function chunksOfPage(pageNumber) {
-    if (ocrReady && damagedPages.has(pageNumber)) {
-        return ocrChunks.get(pageNumber) || [{ page: pageNumber, text: '', lang: 'hi', rects: [], pending: true }];
+    if (ocrReady && needsOcr(pageNumber)) {
+        const lang = damagedPages.has(pageNumber) ? 'hi' : 'en';
+        return ocrChunks.get(pageNumber) || [{ page: pageNumber, text: '', lang, rects: [], pending: true }];
     }
     return pageChunks[pageNumber - 1] || [];
 }
@@ -235,9 +247,13 @@ function recognizePage(pageNumber) {
     const job = (async () => {
         try {
             const page = await pdfDocument.getPage(pageNumber);
-            const { text, runs } = await ocr.recognizePage(page);
+            const damaged = damagedPages.has(pageNumber);
+            let usedLangs = 'hin';
+            const { text, runs } = await ocr.recognizePage(page, damaged ? 'hin' : () => (usedLangs = scanLangs));
             const result = chunksForPage(pageNumber, text, runs, pageSizes[pageNumber - 1]);
             if (generation !== loadGeneration) return;
+            if (!damaged && usedLangs === 'eng+hin') scanLangs = ocr.languagesFromText(text) || scanLangs;
+            // A blank scanned page gives nothing and is skipped (004-05).
             ocrChunks.set(pageNumber, result.length ? result : pageChunks[pageNumber - 1]);
         } catch (error) {
             if (generation !== loadGeneration) return;
@@ -268,17 +284,20 @@ function recognizeAhead(pageNumber) {
 
 function updateDamageNote() {
     damageNote.replaceChildren();
-    if (!damagedPages.size) return;
-    const pages = damagedPages.size === 1 ? '1 page' : `${damagedPages.size} pages`;
+    if (!damagedPages.size && !scannedPages.size) return;
+    const count = (n) => (n === 1 ? '1 page' : `${n} pages`);
+    const problems = [];
+    if (scannedPages.size) problems.push(`This PDF is a scanned copy (${count(scannedPages.size)} with no text).`);
+    if (damagedPages.size) problems.push(`${scannedPages.size ? 'Its' : "This PDF's"} Hindi text is damaged on ${count(damagedPages.size)}.`);
     if (ocrReady) {
-        damageNote.textContent = `This PDF's Hindi text is damaged on ${pages}. Those pages are read from the page image instead.`;
+        damageNote.textContent = `${problems.join(' ')} Those pages are read from the page image.`;
         return;
     }
-    damageNote.append(`This PDF's Hindi text is damaged on ${pages}, so words would be read wrongly. `);
+    damageNote.append(`${problems.join(' ')} Those pages can't be read correctly without page reading. `);
     if (!ocr.supported()) return;
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = `Download Hindi page reading (${ocr.OCR_MEGABYTES} MB)`;
+    button.textContent = `Download page reading (${ocr.OCR_MEGABYTES} MB)`;
     button.addEventListener('click', () => settings.openOcr());
     damageNote.append(button);
 }
@@ -459,7 +478,9 @@ function speak(index) {
         // Recognise the page image first, then read from its first (or tapped) sentence.
         recognizePage(chunk.page).then(() => {
             if (token !== speakToken || !running || paused) return;
+            // A page that gave no text is gone from chunks, so this is the next page (or the end).
             let target = firstIndexOfPage(chunk.page);
+            if (target < 0) target = chunks.length;
             if (pendingTap && pendingTap.page === chunk.page) {
                 const tapped = sentenceAt(pendingTap.page, pendingTap.x, pendingTap.y, pendingTap.aspect);
                 if (tapped >= 0) target = tapped;
@@ -659,6 +680,8 @@ async function openPdf(file) {
     chunks = [];
     pageChunks = [];
     damagedPages = new Set();
+    scannedPages = new Set();
+    scanLangs = 'eng+hin';
     ocrChunks.clear();
     recognizing.clear();
     pendingTap = null;
@@ -685,8 +708,9 @@ async function openPdf(file) {
         pageChunks = result.textChunks;
         pageSizes = result.sizes;
         damagedPages = result.damaged;
+        scannedPages = result.scanned;
         pageCount = pdf.numPages;
-        ocrReady = damagedPages.size > 0 && await ocr.isDownloaded();
+        ocrReady = (damagedPages.size > 0 || scannedPages.size > 0) && await ocr.isDownloaded();
         if (generation !== loadGeneration) return;
         rebuildChunks();
         positionKey = `readaloud:position:${file.name}:${file.size}`;
@@ -699,7 +723,11 @@ async function openPdf(file) {
     }
 
     if (chunks.length === 0) {
-        status.textContent = 'No selectable text found. Scanned PDFs need OCR before they can be read aloud.';
+        // A scanned PDF without page reading: show the pages and offer the download (004-02).
+        updateDamageNote();
+        status.textContent = scannedPages.size
+            ? 'This PDF is a scanned copy. Download page reading to read it aloud.'
+            : 'No text found in this PDF.';
         return;
     }
     startButton.disabled = !synth && !packs.supported();
@@ -797,10 +825,12 @@ const settings = initSettings({
     onTest: testVoice,
     // OCR was downloaded or deleted: switch damaged pages between page images and text.
     onOcrChange: async () => {
-        ocrReady = damagedPages.size > 0 && await ocr.isDownloaded();
+        ocrReady = (damagedPages.size > 0 || scannedPages.size > 0) && await ocr.isDownloaded();
         updateDamageNote();
-        if (!chunks.length) return;
+        if (!pageCount) return;
         rebuildChunks();
+        startButton.disabled = !chunks.length || (!synth && !packs.supported());
+        if (!chunks.length) return;
         if (running && !paused) jumpTo(currentIndex, false);
         else {
             showSentence(currentIndex, false);
